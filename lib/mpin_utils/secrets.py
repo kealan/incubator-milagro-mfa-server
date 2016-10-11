@@ -29,7 +29,7 @@ from tornado.httputil import url_concat
 from tornado.log import app_log as log
 from tornado.options import define, options
 
-import crypto
+import mpin
 from mpin_utils.common import (
     fetchConfig,
     Keys,
@@ -38,9 +38,15 @@ from mpin_utils.common import (
     Time,
 )
 
+HASH_TYPE_MPIN = mpin.SHA256
+    
+today = mpin.today
 
-today = crypto.today
+class CryptoError(Exception):
 
+    """Exception raises by crypto module."""
+
+    pass
 
 def generate_aes_key(passphrase, salt):
     """Return AES key (128 bit) using a pass-phrase.
@@ -64,12 +70,12 @@ def backup_master_secret(master_secret, encrypt_master_secret, passphrase, salt,
     }
 
     if encrypt_master_secret:
-        ciphertext_hex, iv_hex, tag_hex = crypto.aes_gcm_encrypt(
-            master_secret, aes_key, rng, time.strftime('%Y-%m-%dT%H:%M:%SZ'))
+        iv = mpin.generate_random(rng, mpin.IVL)
+        ciphertext, tag = mpin.aes_gcm_encrypt(aes_key,iv,time.strftime('%Y-%m-%dT%H:%M:%SZ'),master_secret)
         data.update({
-            'IV': iv_hex,
-            'ciphertext': ciphertext_hex,
-            'tag': tag_hex})
+            'IV': iv.encode("hex"),
+            'ciphertext': ciphertext.encode("hex"),
+            'tag': tag.encode("hex")})
     else:
         data['master_secret_hex'] = master_secret.encode('hex'),
 
@@ -79,7 +85,8 @@ def backup_master_secret(master_secret, encrypt_master_secret, passphrase, salt,
 
 def generate_random_number(rng, length):
     """Return random number with predefined length."""
-    return crypto.random_generate(rng, length)
+    random_value = mpin.generate_random(rng, length)
+    return random_value.encode("hex")
 
 
 def generate_ott(length, rng, encoding=None):
@@ -104,7 +111,7 @@ def generate_otp(rng):
 
     Uses the Random Number Generator to generate 6 long value
     """
-    return crypto.generate_otp(rng)
+    return mpin.generate_otp(rng)
 
 
 def get_checksum(num, length):
@@ -133,7 +140,7 @@ def generate_random_webid(rng, use_checksum=True):
 
 def generate_auth_ott(rng):
     """Return auth OTT."""
-    return generate_random_number(rng, crypto.PAS)
+    return generate_random_number(rng, mpin.PAS)
 
 
 class SecretsError(Exception):
@@ -152,7 +159,7 @@ class MasterSecret(object):
 
     def __init__(self, passphrase, salt, seed, time, backup_file=None, encrypt_master_secret=True):
         """Constructor."""
-        self.rng = crypto.get_random_generator(seed)
+        self.rng = mpin.create_csprng(seed)
         self.master_secret, self.start_time = self._get_master_secret(
             passphrase, salt, time, backup_file, encrypt_master_secret)
 
@@ -183,8 +190,9 @@ class MasterSecret(object):
     def _generate_master_secret(self):
         """Generate the M-Pin Master Secret."""
         try:
-            return crypto.mpin_random_generate(self.rng)
-        except crypto.CryptoError as e:
+            error_code, ms = mpin.random_generate(self.rng)
+            return ms
+        except CryptoError as e:
             log.error(e)
             raise SecretsError('M-Pin Master Secret Generation Failed')
 
@@ -199,19 +207,19 @@ class MasterSecret(object):
         except ValueError:
             raise SecretsError('Master Secret backup file is corrupted.')
 
+
         if encrypt_master_secret:
-            tag, plaintext = crypto.aes_gcm_decrypt(
+            master_secret, tag = mpin.aes_gcm_decrypt(
                 aes_key=generate_aes_key(passphrase, salt),
                 iv=str(backup['IV'].decode('hex')),
                 header=str(backup['startTime']),
                 ciphertext=str(backup['ciphertext'].decode('hex')))
 
             # Check authentication tag
-            if backup['tag'] != tag:
+            if backup['tag'] != tag.encode("hex"):
                 raise SecretsError('AES-GSM Decryption Failed. Authentication tag is not correct')
 
             self.start_time = Time.ISOtoDateTime(str(backup['startTime']))
-            master_secret = plaintext.decode('hex')
         else:
             self.start_time = Time.ISOtoDateTime(backup['startTime'])
             master_secret = backup['master_secret_hex'].decode('hex')
@@ -221,27 +229,37 @@ class MasterSecret(object):
     def get_server_secret(self):
         """Generate server secret."""
         try:
-            return crypto.get_server_secret(self.master_secret)
-        except crypto.CryptoError as e:
+            rtn, server_secret = mpin.get_server_secret(self.master_secret)    
+            if rtn != 0:
+                raise CryptoError(rtn)
+            return server_secret.encode("hex")
+        except CryptoError as e:
             log.error(e)
             raise SecretsError('Server Secret generation failed')
 
     def get_client_secret(self, mpin_id):
         """Generate client secret."""
         try:
-            return crypto.get_client_multiple(self.master_secret, mpin_id)
-        except crypto.CryptoError as e:
+            rtn, client_secret = mpin.get_client_secret(self.master_secret, mpin_id)    
+            if rtn != 0:
+                raise CryptoError(rtn)
+            return client_secret.encode("hex")
+        except CryptoError as e:
             log.error(e)
             raise SecretsError('Client secret generation failed')
 
     def get_time_permits(self, mpin_id, count):
         """Generate client time permit."""
-        start_date = crypto.today()
+        start_date = mpin.today()
         try:
-            return dict(
-                (date, crypto.get_time_permit(self.master_secret, mpin_id, date))
-                for date in range(start_date, start_date + count))
-        except crypto.CryptoError as e:
+            time_permits = {}
+            for date in range(start_date, start_date + count):
+                rtn, time_permit = mpin.get_client_permit(HASH_TYPE_MPIN, date, self.master_secret, mpin_id)
+                time_permits[date] = time_permit.encode("hex")
+                if rtn != 0:
+                    raise CryptoError(rtn)
+            return time_permits
+        except CryptoError as e:
             log.error(e)
             raise SecretsError('M-Pin Time Permit Generation Failed')
 
@@ -257,7 +275,7 @@ class ServerSecret(object):
 
     def __init__(self, seed, app_id, app_key):
         """Constructor."""
-        self.rng = crypto.get_random_generator(seed)
+        self.rng = mpin.create_csprng(seed)
         self.app_id = app_id
         self.app_key = app_key
         self.server_secret = self._get_server_secret()
@@ -363,18 +381,22 @@ class ServerSecret(object):
         customer_server_secret = self._get_customer_server_secret_share(expires)
 
         try:
-            server_secret_hex = crypto.mpin_recombine_g2(certivox_server_secret, customer_server_secret)
-        except crypto.CryptoError as e:
+            rtn, server_secret = mpin.recombine_G2(certivox_server_secret, customer_server_secret)
+            if rtn != 0:
+                raise CryptoError(rtn)
+        except CryptoError as e:
             log.error(e)
             raise SecretsError('M-Pin Server Secret Generation Failed')
 
-        return server_secret_hex.decode("hex")
+        return server_secret
 
     def get_pass1_value(self):
         """Return pass1 value."""
         try:
-            random_number = crypto.mpin_random_generate(self.rng)
-        except crypto.CryptoError as e:
+            rtn, random_number = mpin.random_generate(self.rng)
+            if rtn != 0:
+                raise CryptoError(rtn)            
+        except CryptoError as e:
             log.error(e)
             raise SecretsError('Pass 1 - failed to generate Y')
 
@@ -386,15 +408,13 @@ class ServerSecret(object):
         y - pass 1 values
         v - pass 2 value in question
         """
-        date = crypto.today()
+        date = mpin.today()
         check_dates = [date]
         if Time.syncedNow().hour < 1:
             check_dates.append(date - 1)
 
         for date in check_dates:
-            hid, htid = crypto.mpin_server_1(mpin_id, date)
-            success, _, _ = crypto.mpin_server_2(self.server_secret, v, date, hid, htid, y, u, ut)
-            if success != -19:
-                break
+            hid, htid = mpin.server_1(HASH_TYPE_MPIN, date, mpin_id)
+            success, _, _ = mpin.server_2(date, hid, htid, y, self.server_secret, u, ut, v)
 
         return success
