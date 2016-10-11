@@ -33,7 +33,7 @@ function get_crypto {
     echo "Get Milagro Crypto C Library"
     mkdir -p install
     cd install || exit
-    git clone https://github.com/miracl/milagro-crypto-c.git 
+    git clone -b master https://github.com/miracl/milagro-crypto-c.git 
 
     cd milagro-crypto-c || exit
 }
